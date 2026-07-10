@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import enum
+import hashlib
+import json
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -18,17 +21,11 @@ class AnimationFormat(enum.Enum):
     APNG = "apng"
 
 
-class Renderer(enum.Enum):
-    GKA = "gka"
-    DIRECT = "direct"
-
-
 @dataclass(frozen=True)
 class ToolConfig:
     ffmpeg: str = "ffmpeg"
     ffprobe: str = "ffprobe"
-    rembg: str = "rembg"
-    gka: str = "gka"
+    backgroundremover: str = "backgroundremover"
 
 
 @dataclass(frozen=True)
@@ -39,29 +36,17 @@ class CudaStatus:
 
 
 @dataclass(frozen=True)
-class RembgOptions:
+class BackgroundRemovalOptions:
     model: str = "u2net"
     alpha_matting: bool = False
     alpha_matting_foreground_threshold: int | None = None
     alpha_matting_background_threshold: int | None = None
     alpha_matting_erode_size: int | None = None
+    alpha_matting_base_size: int | None = None
     only_mask: bool = False
-    post_process_mask: bool = False
-    bgcolor: tuple[int, int, int, int] | None = None
-    extras: str | None = None
-
-
-@dataclass(frozen=True)
-class GkaOptions:
-    template: str = "css"
-    unique: bool = False
-    crop: bool = False
-    sprites: bool = False
-    algorithm: str | None = None
-    prefix: str | None = None
-    mini: bool = False
-    frame_duration: float | None = None
-    info: bool = False
+    mask_threshold: int | None = None
+    background_color: tuple[int, int, int] | None = None
+    background_image: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -77,13 +62,10 @@ def make_animation(
     video_path: Path,
     frames: int,
     output_path: Path,
-    renderer: Renderer = Renderer.GKA,
-    output_format: AnimationFormat = AnimationFormat.WEBP,
+    output_format: AnimationFormat = AnimationFormat.APNG,
     fps: float = 12.0,
-    rembg_model: str = "u2net",
-    gka_template: str = "css",
-    rembg_options: RembgOptions | None = None,
-    gka_options: GkaOptions | None = None,
+    background_model: str = "u2net",
+    background_options: BackgroundRemovalOptions | None = None,
     keep_temp: bool = True,
     tools: ToolConfig = ToolConfig(),
     progress: Callable[[str], None] | None = None,
@@ -94,78 +76,75 @@ def make_animation(
         raise PipelineError("fps must be greater than 0")
 
     emit = progress or (lambda _: None)
-    tools = resolve_tools(tools, renderer)
-    rembg_options = rembg_options or RembgOptions(model=rembg_model)
-    gka_options = gka_options or GkaOptions(template=gka_template)
+    tools = resolve_tools(tools)
+    background_options = background_options or BackgroundRemovalOptions(model=background_model)
 
     video_path = video_path.resolve()
-    output_path = output_path.resolve()
-    job_dir = build_job_dir(output_path, renderer)
-    raw_frames_dir = job_dir / "raw_frames"
-    transparent_frames_dir = job_dir / "transparent_frames"
+    output_path = normalize_output_path(output_path.resolve(), output_format)
+    frame_cache_tag = build_frame_cache_tag(video_path, frames, background_options)
+    frame_cache_dir = build_frame_cache_dir(output_path.parent, frame_cache_tag)
+    raw_frames_dir = frame_cache_dir / "raw_frames"
+    transparent_frames_dir = frame_cache_dir / "transparent_frames"
 
     cuda_status = detect_cuda_status()
     emit(format_cuda_status(cuda_status))
-    emit(f"Using rembg model: {rembg_options.model}")
-    emit(f"Renderer: {renderer.value}")
+    emit(f"Using backgroundremover model: {background_options.model}")
+    emit(f"Frame cache tag: {frame_cache_tag}")
+    emit(f"Output format: {output_format.value}")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     raw_frames_dir.mkdir(parents=True, exist_ok=True)
     transparent_frames_dir.mkdir(parents=True, exist_ok=True)
 
-    emit(f"Probing video duration: {video_path}")
-    duration = probe_duration(video_path, tools)
-    timestamps = sample_timestamps(duration, frames)
-    emit(f"Sampling {frames} frame(s) across {duration:.3f}s")
-
-    raw_frames = []
-    transparent_frames = []
-    for index, timestamp in enumerate(timestamps, start=1):
-        raw_frame = raw_frames_dir / frame_name(index)
-        transparent_frame = transparent_frames_dir / frame_name(index)
-        emit(f"[{index}/{frames}] Extracting frame at {timestamp:.3f}s")
-        run_checked(build_extract_frame_cmd(tools.ffmpeg, video_path, timestamp, raw_frame))
-        if not raw_frame.is_file():
-            raise PipelineError(f"ffmpeg did not produce frame: {raw_frame}")
-        emit(f"[{index}/{frames}] Removing background")
-        run_checked(build_remove_background_cmd(tools.rembg, raw_frame, transparent_frame, rembg_options))
-        if not transparent_frame.is_file():
-            raise PipelineError(f"rembg did not produce frame: {transparent_frame}")
-        raw_frames.append(raw_frame)
-        transparent_frames.append(transparent_frame)
-
-    if len(raw_frames) != frames or len(transparent_frames) != frames:
-        raise PipelineError("failed to produce the requested number of frames")
-
-    if renderer is Renderer.GKA:
-        emit(f"Generating GKA animation in: {output_path}")
-        run_checked(
-            build_gka_animation_cmd(
-                tools.gka,
-                transparent_frames_dir,
-                output_path,
-                gka_options,
-                fps,
-            )
-        )
-    elif renderer is Renderer.DIRECT:
-        emit(f"Encoding {output_format.value} animation: {output_path}")
-        run_checked(
-            build_encode_animation_cmd(
-                tools.ffmpeg,
-                transparent_frames_dir,
-                output_path,
-                output_format,
-                fps,
-            )
-        )
+    if has_complete_frame_set(transparent_frames_dir, frames):
+        emit(f"Reusing transparent frames: {transparent_frames_dir}")
     else:
-        raise PipelineError(f"unsupported renderer: {renderer}")
+        emit(f"Probing video duration: {video_path}")
+        duration = probe_duration(video_path, tools)
+        timestamps = sample_timestamps(duration, frames)
+        emit(f"Sampling {frames} frame(s) across {duration:.3f}s")
+
+        raw_frames = []
+        transparent_frames = []
+        for index, timestamp in enumerate(timestamps, start=1):
+            raw_frame = raw_frames_dir / frame_name(index)
+            transparent_frame = transparent_frames_dir / frame_name(index)
+            emit(f"[{index}/{frames}] Extracting frame at {timestamp:.3f}s")
+            run_checked(build_extract_frame_cmd(tools.ffmpeg, video_path, timestamp, raw_frame))
+            if not raw_frame.is_file():
+                raise PipelineError(f"ffmpeg did not produce frame: {raw_frame}")
+            emit(f"[{index}/{frames}] Removing background")
+            run_checked(
+                build_remove_background_cmd(
+                    tools.backgroundremover,
+                    raw_frame,
+                    transparent_frame,
+                    background_options,
+                )
+            )
+            if not transparent_frame.is_file():
+                raise PipelineError(f"backgroundremover did not produce frame: {transparent_frame}")
+            raw_frames.append(raw_frame)
+            transparent_frames.append(transparent_frame)
+
+        if len(raw_frames) != frames or len(transparent_frames) != frames:
+            raise PipelineError("failed to produce the requested number of frames")
+
+    emit(f"Encoding {output_format.value} animation: {output_path}")
+    run_checked(
+        build_encode_animation_cmd(
+            tools.ffmpeg,
+            transparent_frames_dir,
+            output_path,
+            output_format,
+            fps,
+        )
+    )
 
     kept_intermediates = keep_temp
     if not keep_temp:
-        emit(f"Deleting intermediate frames: {job_dir}")
-        shutil.rmtree(job_dir, ignore_errors=True)
+        emit(f"Deleting intermediate frames: {frame_cache_dir}")
+        shutil.rmtree(frame_cache_dir, ignore_errors=True)
     else:
         emit(f"Keeping raw frames: {raw_frames_dir}")
         emit(f"Keeping transparent frames: {transparent_frames_dir}")
@@ -178,29 +157,82 @@ def make_animation(
     )
 
 
-def build_job_dir(output_path: Path, renderer: Renderer) -> Path:
-    if renderer is Renderer.GKA:
-        return output_path / "_tbam_intermediates"
-    return output_path.parent / output_path.stem
+def normalize_output_path(output_path: Path, output_format: AnimationFormat) -> Path:
+    if output_path.suffix:
+        return output_path
+    return output_path.with_suffix(f".{output_format.value}")
 
 
-def resolve_tools(tools: ToolConfig, renderer: Renderer = Renderer.GKA) -> ToolConfig:
+def build_frame_cache_dir(output_parent: Path, cache_tag: str) -> Path:
+    return output_parent / "_tbam_frames" / cache_tag
+
+
+def build_frame_cache_tag(
+    video_path: Path,
+    frames: int,
+    background_options: BackgroundRemovalOptions,
+) -> str:
+    video_path = video_path.resolve()
+    stem = slugify(video_path.stem) or "video"
+    payload = {
+        "video": file_fingerprint(video_path),
+        "frames": frames,
+        "background": background_options_fingerprint(background_options),
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    return f"{stem}_frames-{frames}_{digest}"
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", value).strip("-").lower()
+    return slug[:48].strip("-")
+
+
+def file_fingerprint(path: Path) -> dict[str, int | str | None]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return {
+            "path": str(path),
+            "size": None,
+            "mtime_ns": None,
+        }
+    return {
+        "path": str(path),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def background_options_fingerprint(options: BackgroundRemovalOptions) -> dict[str, object]:
+    background_image = None
+    if options.background_image is not None:
+        background_image = file_fingerprint(options.background_image.resolve())
+
+    return {
+        "model": options.model,
+        "alpha_matting": options.alpha_matting,
+        "alpha_matting_foreground_threshold": options.alpha_matting_foreground_threshold,
+        "alpha_matting_background_threshold": options.alpha_matting_background_threshold,
+        "alpha_matting_erode_size": options.alpha_matting_erode_size,
+        "alpha_matting_base_size": options.alpha_matting_base_size,
+        "only_mask": options.only_mask,
+        "mask_threshold": options.mask_threshold,
+        "background_color": options.background_color,
+        "background_image": background_image,
+    }
+
+
+def has_complete_frame_set(frames_dir: Path, frames: int) -> bool:
+    return all((frames_dir / frame_name(index)).is_file() for index in range(1, frames + 1))
+
+
+def resolve_tools(tools: ToolConfig) -> ToolConfig:
     ffmpeg = resolve_required_executable(tools.ffmpeg)
     ffprobe = resolve_required_executable(tools.ffprobe)
-    rembg = resolve_required_executable(tools.rembg)
-    gka = tools.gka
+    backgroundremover = resolve_required_executable(tools.backgroundremover)
 
-    if renderer is Renderer.GKA:
-        gka = resolve_required_executable(
-            tools.gka,
-            local_fallbacks=[Path.cwd() / "node_modules" / ".bin" / tools.gka],
-        )
-        if executable_needs_node(gka) and shutil.which("node") is None:
-            raise PipelineError(
-                f"gka was found at {gka}, but node is not on PATH; install node or pass a working --gka executable"
-            )
-
-    return ToolConfig(ffmpeg=ffmpeg, ffprobe=ffprobe, rembg=rembg, gka=gka)
+    return ToolConfig(ffmpeg=ffmpeg, ffprobe=ffprobe, backgroundremover=backgroundremover)
 
 
 def resolve_required_executable(executable: str, local_fallbacks: Sequence[Path] = ()) -> str:
@@ -215,39 +247,49 @@ def resolve_required_executable(executable: str, local_fallbacks: Sequence[Path]
     raise PipelineError(f"missing required executable(s): {executable}")
 
 
-def executable_needs_node(executable: str) -> bool:
-    path = Path(executable)
-    if not path.is_file():
-        return False
-
-    try:
-        contents = path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return False
-
-    return "node" in contents[:2048]
-
-
 def detect_cuda_status() -> CudaStatus:
     try:
-        import onnxruntime as ort
+        import torch
     except Exception as exc:
         return CudaStatus(
             available=False,
             providers=(),
-            detail=f"onnxruntime is not importable in this environment: {exc}",
+            detail=f"torch is not importable in this environment: {exc}",
         )
 
-    providers = tuple(ort.get_available_providers())
-    available = "CUDAExecutionProvider" in providers
-    detail = "CUDAExecutionProvider is available" if available else "CUDAExecutionProvider is not available"
-    return CudaStatus(available=available, providers=providers, detail=detail)
+    try:
+        available = bool(torch.cuda.is_available())
+    except Exception as exc:
+        return CudaStatus(
+            available=False,
+            providers=(),
+            detail=f"torch CUDA detection failed: {exc}",
+        )
+
+    if not available:
+        return CudaStatus(
+            available=False,
+            providers=(),
+            detail="torch CUDA is not available",
+        )
+
+    try:
+        device_count = int(torch.cuda.device_count())
+        devices = tuple(torch.cuda.get_device_name(index) for index in range(device_count))
+    except Exception as exc:
+        return CudaStatus(
+            available=True,
+            providers=(),
+            detail=f"torch CUDA is available, but device names could not be read: {exc}",
+        )
+
+    return CudaStatus(available=True, providers=devices, detail="torch CUDA is available")
 
 
 def format_cuda_status(status: CudaStatus) -> str:
     availability = "yes" if status.available else "no"
-    providers = ", ".join(status.providers) if status.providers else "none"
-    return f"CUDA available for rembg: {availability} ({status.detail}; providers: {providers})"
+    devices = ", ".join(status.providers) if status.providers else "none"
+    return f"CUDA available for backgroundremover: {availability} ({status.detail}; devices: {devices})"
 
 
 def probe_duration(video_path: Path, tools: ToolConfig = ToolConfig()) -> float:
@@ -314,17 +356,18 @@ def build_extract_frame_cmd(
 
 
 def build_remove_background_cmd(
-    rembg: str,
+    backgroundremover: str,
     input_path: Path,
     output_path: Path,
-    options: RembgOptions | str = RembgOptions(),
+    options: BackgroundRemovalOptions | str = BackgroundRemovalOptions(),
 ) -> list[str]:
     if isinstance(options, str):
-        options = RembgOptions(model=options)
+        options = BackgroundRemovalOptions(model=options)
 
     command = [
-        rembg,
-        "i",
+        backgroundremover,
+        "-i",
+        str(input_path),
         "-m",
         options.model,
     ]
@@ -336,55 +379,18 @@ def build_remove_background_cmd(
         command.extend(["-ab", str(options.alpha_matting_background_threshold)])
     if options.alpha_matting_erode_size is not None:
         command.extend(["-ae", str(options.alpha_matting_erode_size)])
+    if options.alpha_matting_base_size is not None:
+        command.extend(["-az", str(options.alpha_matting_base_size)])
     if options.only_mask:
         command.append("-om")
-    if options.post_process_mask:
-        command.append("-ppm")
-    if options.bgcolor is not None:
-        command.append("-bgc")
-        command.extend(str(value) for value in options.bgcolor)
-    if options.extras is not None:
-        command.extend(["-x", options.extras])
+    if options.mask_threshold is not None:
+        command.extend(["-mt", str(options.mask_threshold)])
+    if options.background_color is not None:
+        command.extend(["-bc", ",".join(str(value) for value in options.background_color)])
+    if options.background_image is not None:
+        command.extend(["-bi", str(options.background_image)])
 
-    command.extend([str(input_path), str(output_path)])
-    return command
-
-
-def build_gka_animation_cmd(
-    gka: str,
-    frames_dir: Path,
-    output_path: Path,
-    options: GkaOptions | str,
-    fps: float,
-) -> list[str]:
-    if isinstance(options, str):
-        options = GkaOptions(template=options)
-
-    command = [
-        gka,
-        str(frames_dir),
-        "-t",
-        options.template,
-        "-f",
-        format_gka_frame_duration_from_options(fps, options),
-        "-o",
-        str(output_path),
-    ]
-    if options.unique:
-        command.append("-u")
-    if options.crop:
-        command.append("-c")
-    if options.sprites:
-        command.append("-s")
-    if options.algorithm is not None:
-        command.extend(["-a", options.algorithm])
-    if options.prefix is not None:
-        command.extend(["-p", options.prefix])
-    if options.mini:
-        command.append("-m")
-    if options.info:
-        command.append("-i")
-
+    command.extend(["-o", str(output_path)])
     return command
 
 
@@ -443,16 +449,6 @@ def build_encode_animation_cmd(
 
 def format_fps(fps: float) -> str:
     return f"{fps:g}"
-
-
-def format_gka_frame_duration(fps: float) -> str:
-    return f"{1 / fps:g}"
-
-
-def format_gka_frame_duration_from_options(fps: float, options: GkaOptions) -> str:
-    if options.frame_duration is not None:
-        return f"{options.frame_duration:g}"
-    return format_gka_frame_duration(fps)
 
 
 def run_checked(command: Sequence[str]) -> subprocess.CompletedProcess[str]:

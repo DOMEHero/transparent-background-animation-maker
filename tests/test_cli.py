@@ -113,7 +113,7 @@ def test_cli_keeps_make_subcommand_as_backward_compatible_alias(
     assert calls[0]["video_path"] == input_video
 
 
-def test_cli_passes_inherited_rembg_and_gka_options(
+def test_cli_passes_inherited_backgroundremover_options(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -140,61 +140,42 @@ def test_cli_passes_inherited_rembg_and_gka_options(
             "1",
             "--output",
             str(output_path),
-            "--rembg-model",
-            "sam",
-            "--rembg-alpha-matting",
-            "--rembg-alpha-matting-foreground-threshold",
+            "--model",
+            "u2netp",
+            "--alpha-matting",
+            "--alpha-matting-foreground-threshold",
             "230",
-            "--rembg-alpha-matting-background-threshold",
+            "--alpha-matting-background-threshold",
             "20",
-            "--rembg-alpha-matting-erode-size",
+            "--alpha-matting-erode-size",
             "15",
-            "--rembg-only-mask",
-            "--rembg-post-process-mask",
-            "--rembg-bgcolor",
+            "--alpha-matting-base-size",
+            "800",
+            "--only-mask",
+            "--mask-threshold",
+            "128",
+            "--background-color",
             "255",
             "0",
             "0",
-            "128",
-            "--rembg-extras",
-            '{"sam_prompt": []}',
-            "--gka-template",
-            "canvas",
-            "--gka-unique",
-            "--gka-crop",
-            "--gka-sprites",
-            "--gka-algorithm",
-            "binary-tree",
-            "--gka-prefix",
-            "hero",
-            "--gka-mini",
-            "--gka-frame-duration",
-            "0.1",
-            "--gka-info",
+            "--background-image",
+            str(tmp_path / "background.png"),
         ]
     )
 
     assert status == 0
-    rembg_options = calls[0]["rembg_options"]
-    gka_options = calls[0]["gka_options"]
-    assert rembg_options.model == "sam"
-    assert rembg_options.alpha_matting is True
-    assert rembg_options.alpha_matting_foreground_threshold == 230
-    assert rembg_options.alpha_matting_background_threshold == 20
-    assert rembg_options.alpha_matting_erode_size == 15
-    assert rembg_options.only_mask is True
-    assert rembg_options.post_process_mask is True
-    assert rembg_options.bgcolor == (255, 0, 0, 128)
-    assert rembg_options.extras == '{"sam_prompt": []}'
-    assert gka_options.template == "canvas"
-    assert gka_options.unique is True
-    assert gka_options.crop is True
-    assert gka_options.sprites is True
-    assert gka_options.algorithm == "binary-tree"
-    assert gka_options.prefix == "hero"
-    assert gka_options.mini is True
-    assert gka_options.frame_duration == 0.1
-    assert gka_options.info is True
+    background_options = calls[0]["background_options"]
+    assert calls[0]["background_model"] == "u2netp"
+    assert background_options.model == "u2netp"
+    assert background_options.alpha_matting is True
+    assert background_options.alpha_matting_foreground_threshold == 230
+    assert background_options.alpha_matting_background_threshold == 20
+    assert background_options.alpha_matting_erode_size == 15
+    assert background_options.alpha_matting_base_size == 800
+    assert background_options.only_mask is True
+    assert background_options.mask_threshold == 128
+    assert background_options.background_color == (255, 0, 0)
+    assert background_options.background_image == tmp_path / "background.png"
 
 
 def test_cli_rejects_unsupported_format(tmp_path: Path) -> None:

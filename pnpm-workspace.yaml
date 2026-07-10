@@ -1,6 +1,0 @@
-allowBuilds:
-  gifsicle: true
-  jpeg-recompress-bin: true
-  jpegtran-bin: true
-  optipng-bin: true
-  pngquant-bin: true

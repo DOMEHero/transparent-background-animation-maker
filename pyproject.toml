@@ -6,9 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11,<3.12"
 license = { text = "GPL-3.0-only" }
 dependencies = [
-    "onnxruntime-gpu[cuda,cudnn]>=1.21,<1.27",
+    "backgroundremover>=0.4.4",
     "pillow>=10.0",
-    "rembg[gpu,cli]>=2.0.67",
 ]
 
 [project.scripts]

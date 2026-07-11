@@ -49,16 +49,26 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output animation format. Defaults to apng.",
     )
     parser.add_argument(
-        "--output",
+        "--output-dir",
         type=Path,
-        required=True,
-        help="Output animation path.",
+        default=Path("output"),
+        help="Output root directory. Defaults to output.",
     )
     parser.add_argument(
         "--fps",
         type=parse_positive_float,
         default=12.0,
         help="Playback frame rate for the rendered animation. Defaults to 12.",
+    )
+    parser.add_argument(
+        "--spritesheet-rows",
+        type=parse_positive_int,
+        help="Number of rows for --format spritesheet. Defaults to automatic layout.",
+    )
+    parser.add_argument(
+        "--spritesheet-columns",
+        type=parse_positive_int,
+        help="Number of columns for --format spritesheet. Defaults to automatic layout.",
     )
     parser.add_argument(
         "--keep-temp",
@@ -153,9 +163,11 @@ def run_make_command(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         result = make_animation(
             video_path=args.input,
             frames=args.frames,
-            output_path=args.output,
+            output_dir=args.output_dir,
             output_format=AnimationFormat(args.format),
             fps=args.fps,
+            spritesheet_rows=args.spritesheet_rows,
+            spritesheet_columns=args.spritesheet_columns,
             background_model=args.model,
             background_options=BackgroundRemovalOptions(
                 model=args.model,
@@ -181,7 +193,7 @@ def run_make_command(args: argparse.Namespace, parser: argparse.ArgumentParser) 
         print(f"tbam: {exc}", file=sys.stderr)
         return 1
 
-    print(f"Wrote animation: {result.output_path}")
+    print(f"Wrote output: {result.output_path}")
     if result.kept_intermediates:
         print(f"Raw frames: {result.raw_frames_dir}")
         print(f"Transparent frames: {result.transparent_frames_dir}")

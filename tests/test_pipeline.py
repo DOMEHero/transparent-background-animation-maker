@@ -14,16 +14,17 @@ from tbam.pipeline import (
     BackgroundRemovalOptions,
     PipelineError,
     ToolConfig,
-    build_encode_animation_cmd,
     build_extract_frame_cmd,
-    build_frame_cache_dir,
-    build_frame_cache_tag,
     build_ffprobe_duration_cmd,
+    build_job_dir,
+    build_job_tag,
+    build_output_path,
+    build_render_output_cmd,
+    calculate_spritesheet_layout,
     build_remove_background_cmd,
     detect_cuda_status,
     format_cuda_status,
     make_animation,
-    normalize_output_path,
     resolve_tools,
     run_checked,
     sample_timestamps,
@@ -148,12 +149,13 @@ def test_encode_animation_commands(
     output_format: AnimationFormat,
     expected_flags: list[str],
 ) -> None:
-    command = build_encode_animation_cmd(
+    command = build_render_output_cmd(
         "ffmpeg",
         Path("transparent_frames"),
         Path(f"animation.{output_format.value}"),
         output_format,
         12.0,
+        12,
     )
 
     assert command[:5] == [
@@ -169,33 +171,93 @@ def test_encode_animation_commands(
     assert command[-1] == f"animation.{output_format.value}"
 
 
-def test_normalize_output_path_adds_format_suffix_when_missing() -> None:
-    assert normalize_output_path(Path("out/animation"), AnimationFormat.APNG) == Path("out/animation.apng")
-    assert normalize_output_path(Path("out/animation.webp"), AnimationFormat.APNG) == Path("out/animation.webp")
+def test_spritesheet_command_uses_static_webp_tile_layout() -> None:
+    command = build_render_output_cmd(
+        "ffmpeg",
+        Path("transparent_frames"),
+        Path("spritesheet.webp"),
+        AnimationFormat.SPRITESHEET,
+        12.0,
+        12,
+    )
+
+    assert command[:5] == [
+        "ffmpeg",
+        "-y",
+        "-framerate",
+        "12",
+        "-i",
+    ]
+    assert "transparent_frames/frame_%06d.png" in command
+    assert "-vf" in command
+    assert "tile=4x3:color=black@0.0,format=rgba" in command
+    assert "-c:v" in command
+    assert "libwebp" in command
+    assert command[-1] == "spritesheet.webp"
 
 
-def test_frame_cache_tag_includes_input_file_and_frame_count(tmp_path: Path) -> None:
+def test_spritesheet_command_uses_custom_tile_layout() -> None:
+    command = build_render_output_cmd(
+        "ffmpeg",
+        Path("transparent_frames"),
+        Path("spritesheet.webp"),
+        AnimationFormat.SPRITESHEET,
+        12.0,
+        12,
+        spritesheet_rows=2,
+        spritesheet_columns=6,
+    )
+
+    assert "tile=6x2:color=black@0.0,format=rgba" in command
+
+
+def test_output_paths_are_derived_from_format_and_fps() -> None:
+    animations_dir = Path("output/masha-12frames-hash/animations")
+
+    assert build_output_path(animations_dir, AnimationFormat.APNG, 12) == animations_dir / "animation-12fps.apng"
+    assert build_output_path(animations_dir, AnimationFormat.WEBP, 48) == animations_dir / "animation-48fps.webp"
+    assert build_output_path(animations_dir, AnimationFormat.SPRITESHEET, 48) == animations_dir / "spritesheet.webp"
+
+
+def test_spritesheet_layout_is_nearly_square() -> None:
+    assert calculate_spritesheet_layout(1) == (1, 1)
+    assert calculate_spritesheet_layout(12) == (4, 3)
+    assert calculate_spritesheet_layout(48) == (7, 7)
+
+
+def test_spritesheet_layout_accepts_user_dimensions() -> None:
+    assert calculate_spritesheet_layout(12, rows=2, columns=6) == (6, 2)
+    assert calculate_spritesheet_layout(12, columns=5) == (5, 3)
+    assert calculate_spritesheet_layout(12, rows=5) == (3, 5)
+
+
+def test_spritesheet_layout_rejects_too_small_user_dimensions() -> None:
+    with pytest.raises(PipelineError, match="only fits 10 frame"):
+        calculate_spritesheet_layout(12, rows=2, columns=5)
+
+
+def test_job_tag_includes_input_file_and_frame_count(tmp_path: Path) -> None:
     input_video = tmp_path / "Input Video.mp4"
     input_video.write_bytes(b"video")
     options = BackgroundRemovalOptions(model="u2netp")
 
-    first = build_frame_cache_tag(input_video, 12, options)
-    second = build_frame_cache_tag(input_video, 12, options)
-    different_frame_count = build_frame_cache_tag(input_video, 24, options)
+    first = build_job_tag(input_video, 12, options)
+    second = build_job_tag(input_video, 12, options)
+    different_frame_count = build_job_tag(input_video, 24, options)
 
     assert first == second
-    assert first.startswith("input-video_frames-12_")
-    assert different_frame_count.startswith("input-video_frames-24_")
+    assert first.startswith("input-video-12frames-")
+    assert different_frame_count.startswith("input-video-24frames-")
     assert first != different_frame_count
 
 
-def test_frame_cache_tag_changes_when_background_options_change(tmp_path: Path) -> None:
+def test_job_tag_changes_when_background_options_change(tmp_path: Path) -> None:
     input_video = tmp_path / "input.mp4"
     input_video.write_bytes(b"video")
 
-    default_tag = build_frame_cache_tag(input_video, 12, BackgroundRemovalOptions(model="u2net"))
-    model_tag = build_frame_cache_tag(input_video, 12, BackgroundRemovalOptions(model="u2netp"))
-    matte_tag = build_frame_cache_tag(input_video, 12, BackgroundRemovalOptions(model="u2net", alpha_matting=True))
+    default_tag = build_job_tag(input_video, 12, BackgroundRemovalOptions(model="u2net"))
+    model_tag = build_job_tag(input_video, 12, BackgroundRemovalOptions(model="u2netp"))
+    matte_tag = build_job_tag(input_video, 12, BackgroundRemovalOptions(model="u2net", alpha_matting=True))
 
     assert default_tag != model_tag
     assert default_tag != matte_tag
@@ -287,11 +349,11 @@ def test_make_animation_smoke_with_real_ffmpeg_and_fake_backgroundremover(tmp_pa
     os.chmod(fake_backgroundremover, 0o755)
 
     progress_messages = []
-    output_path = tmp_path / "out" / "animation"
+    output_dir = tmp_path / "output"
     result = make_animation(
         video_path=input_video,
         frames=2,
-        output_path=output_path,
+        output_dir=output_dir,
         output_format=AnimationFormat.APNG,
         fps=4,
         background_model="u2netp",
@@ -300,10 +362,14 @@ def test_make_animation_smoke_with_real_ffmpeg_and_fake_backgroundremover(tmp_pa
         progress=progress_messages.append,
     )
 
-    assert result.output_path == output_path.with_suffix(".apng").resolve()
+    assert result.job_dir.parent == output_dir.resolve()
+    assert result.output_path == result.animations_dir / "animation-4fps.apng"
     assert result.output_path.is_file()
     assert len(list(result.raw_frames_dir.glob("*.png"))) == 2
     assert len(list(result.transparent_frames_dir.glob("*.png"))) == 2
+    assert result.raw_frames_dir == result.job_dir / "raw_frames"
+    assert result.transparent_frames_dir == result.job_dir / "transparent_frames"
+    assert result.animations_dir == result.job_dir / "animations"
     assert any(message.startswith("CUDA available for backgroundremover:") for message in progress_messages)
 
 
@@ -329,18 +395,20 @@ def test_keep_temp_false_preserves_animation_file(tmp_path: Path, monkeypatch: p
     monkeypatch.setattr("tbam.pipeline.shutil.which", lambda executable: executable)
     monkeypatch.setattr("tbam.pipeline.run_checked", fake_run_checked)
 
-    output_path = tmp_path / "out" / "animation"
+    output_dir = tmp_path / "output"
     result = make_animation(
         video_path=tmp_path / "input.mp4",
         frames=1,
-        output_path=output_path,
+        output_dir=output_dir,
         output_format=AnimationFormat.APNG,
         keep_temp=False,
     )
 
-    assert result.output_path == output_path.with_suffix(".apng").resolve()
+    assert result.output_path == result.animations_dir / "animation-12fps.apng"
     assert result.output_path.is_file()
     assert not result.raw_frames_dir.exists()
+    assert not result.transparent_frames_dir.exists()
+    assert result.animations_dir.exists()
 
 
 def test_make_animation_reuses_tagged_transparent_frames_for_new_fps(
@@ -362,10 +430,10 @@ def test_make_animation_reuses_tagged_transparent_frames_for_new_fps(
 
     input_video = tmp_path / "input.mp4"
     input_video.write_bytes(b"video")
-    output_path = tmp_path / "out" / "animation"
+    output_dir = tmp_path / "output"
     options = BackgroundRemovalOptions(model="u2net")
-    cache_tag = build_frame_cache_tag(input_video, 2, options)
-    transparent_frames_dir = build_frame_cache_dir(output_path.parent.resolve(), cache_tag) / "transparent_frames"
+    job_tag = build_job_tag(input_video, 2, options)
+    transparent_frames_dir = build_job_dir(output_dir.resolve(), job_tag) / "transparent_frames"
     transparent_frames_dir.mkdir(parents=True)
     for index in range(1, 3):
         (transparent_frames_dir / f"frame_{index:06d}.png").write_bytes(b"transparent")
@@ -374,14 +442,14 @@ def test_make_animation_reuses_tagged_transparent_frames_for_new_fps(
     result = make_animation(
         video_path=input_video,
         frames=2,
-        output_path=output_path,
+        output_dir=output_dir,
         output_format=AnimationFormat.APNG,
         fps=24,
         background_options=options,
         progress=progress_messages.append,
     )
 
-    assert result.output_path == output_path.with_suffix(".apng").resolve()
+    assert result.output_path == result.animations_dir / "animation-24fps.apng"
     assert result.transparent_frames_dir == transparent_frames_dir
     assert result.output_path.is_file()
     assert len(commands) == 1

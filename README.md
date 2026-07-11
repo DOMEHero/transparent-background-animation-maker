@@ -7,45 +7,63 @@ This project provides a `tbam` command that:
 
 1. Samples a fixed number of frames evenly across a video with `ffmpeg`.
 2. Removes each sampled frame background with `backgroundremover`.
-3. Encodes the transparent frames into an `apng`, `webp`, or `gif` animation with `ffmpeg`.
+3. Encodes the transparent frames into an `apng`, `webp`, or `gif` animation, or a WebP spritesheet, with `ffmpeg`.
 
 ```bash
 uv sync
-uv run tbam input.mp4 --frames 12 --output out/animation
+uv run tbam input.mp4 --frames 12
 ```
 
-`apng` is the default output format. If `--output` has no extension, the selected format is appended:
+`apng` is the default output format. Outputs are written under `output/` by default:
 
 ```text
-out/animation.apng
+output/
+└─ input-12frames-<hash>/
+   ├─ raw_frames/
+   │  ├─ frame_000001.png
+   │  └─ frame_000002.png
+   ├─ transparent_frames/
+   │  ├─ frame_000001.png
+   │  └─ frame_000002.png
+   └─ animations/
+      └─ animation-12fps.apng
 ```
 
 Choose another format with `--format`:
 
 ```bash
-uv run tbam input.mp4 --frames 12 --format webp --output out/animation.webp
+uv run tbam input.mp4 --frames 12 --format webp --fps 48
+uv run tbam input.mp4 --frames 12 --format spritesheet
+uv run tbam input.mp4 --frames 12 --format spritesheet --spritesheet-columns 6 --spritesheet-rows 2
 ```
 
-Intermediate files are kept by default:
+These commands create files like:
 
 ```text
-out/_tbam_frames/<input-tag>_frames-12_<hash>/raw_frames/
-out/_tbam_frames/<input-tag>_frames-12_<hash>/transparent_frames/
+output/input-12frames-<hash>/animations/animation-48fps.webp
+output/input-12frames-<hash>/animations/spritesheet.webp
 ```
 
-The cache tag is based on the input video, requested frame count, and background removal options. It does not include animation FPS or output filename, so you can re-render the same transparent frames at a different playback speed:
+The job directory tag is based on the input video, requested frame count, and background removal options. It does not include animation FPS or render format, so you can re-render the same transparent frames at a different playback speed or as a spritesheet:
 
 ```bash
-uv run tbam input.mp4 --frames 12 --fps 12 --output out/animation-12fps
-uv run tbam input.mp4 --frames 12 --fps 24 --output out/animation-24fps
+uv run tbam input.mp4 --frames 12 --fps 12
+uv run tbam input.mp4 --frames 12 --fps 24 --format webp
+uv run tbam input.mp4 --frames 12 --format spritesheet
 ```
 
-The second command reuses the tagged `transparent_frames` cache when it is complete.
+The later commands reuse the job's `transparent_frames` cache when it is complete.
+
+Use a different output root with:
+
+```bash
+uv run tbam input.mp4 --frames 12 --output-dir renders
+```
 
 Delete intermediates after rendering with:
 
 ```bash
-uv run tbam input.mp4 --frames 12 --output out/animation --keep-temp false
+uv run tbam input.mp4 --frames 12 --keep-temp false
 ```
 
 ## Options
@@ -53,7 +71,9 @@ uv run tbam input.mp4 --frames 12 --output out/animation --keep-temp false
 - `--frames`: Required. The number of frames to sample evenly across the video.
 - `--model`: backgroundremover model name. Defaults to `u2net`.
 - `--fps`: Playback frame rate for the generated animation. Defaults to `12`.
-- `--format`: `apng`, `webp`, or `gif`. Defaults to `apng`.
+- `--format`: `apng`, `webp`, `gif`, or `spritesheet`. Defaults to `apng`.
+- `--output-dir`: Output root directory. Defaults to `output`.
+- `--spritesheet-columns`, `--spritesheet-rows`: Optional layout controls for `--format spritesheet`. If only one is provided, the other is computed.
 - `--ffmpeg`, `--ffprobe`, `--backgroundremover`: Override executable paths when needed.
 
 GIF transparency is limited by the GIF format. Use `apng` or `webp` when high-quality alpha is important.
@@ -77,7 +97,7 @@ The CLI exposes the useful `backgroundremover` image options:
 Example:
 
 ```bash
-uv run tbam input.mp4 --frames 12 --output out/animation \
+uv run tbam input.mp4 --frames 12 \
   --model u2netp \
   --alpha-matting \
   --alpha-matting-erode-size 5

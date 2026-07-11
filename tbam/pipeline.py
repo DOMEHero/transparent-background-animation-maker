@@ -3,6 +3,7 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -19,6 +20,7 @@ class AnimationFormat(enum.Enum):
     WEBP = "webp"
     GIF = "gif"
     APNG = "apng"
+    SPRITESHEET = "spritesheet"
 
 
 @dataclass(frozen=True)
@@ -52,8 +54,10 @@ class BackgroundRemovalOptions:
 @dataclass(frozen=True)
 class MakeResult:
     output_path: Path
+    job_dir: Path
     raw_frames_dir: Path
     transparent_frames_dir: Path
+    animations_dir: Path
     kept_intermediates: bool
 
 
@@ -61,9 +65,11 @@ def make_animation(
     *,
     video_path: Path,
     frames: int,
-    output_path: Path,
+    output_dir: Path = Path("output"),
     output_format: AnimationFormat = AnimationFormat.APNG,
     fps: float = 12.0,
+    spritesheet_rows: int | None = None,
+    spritesheet_columns: int | None = None,
     background_model: str = "u2net",
     background_options: BackgroundRemovalOptions | None = None,
     keep_temp: bool = True,
@@ -80,21 +86,23 @@ def make_animation(
     background_options = background_options or BackgroundRemovalOptions(model=background_model)
 
     video_path = video_path.resolve()
-    output_path = normalize_output_path(output_path.resolve(), output_format)
-    frame_cache_tag = build_frame_cache_tag(video_path, frames, background_options)
-    frame_cache_dir = build_frame_cache_dir(output_path.parent, frame_cache_tag)
-    raw_frames_dir = frame_cache_dir / "raw_frames"
-    transparent_frames_dir = frame_cache_dir / "transparent_frames"
+    output_dir = output_dir.resolve()
+    job_tag = build_job_tag(video_path, frames, background_options)
+    job_dir = build_job_dir(output_dir, job_tag)
+    raw_frames_dir = job_dir / "raw_frames"
+    transparent_frames_dir = job_dir / "transparent_frames"
+    animations_dir = job_dir / "animations"
+    output_path = build_output_path(animations_dir, output_format, fps)
 
     cuda_status = detect_cuda_status()
     emit(format_cuda_status(cuda_status))
     emit(f"Using backgroundremover model: {background_options.model}")
-    emit(f"Frame cache tag: {frame_cache_tag}")
+    emit(f"Job directory: {job_dir}")
     emit(f"Output format: {output_format.value}")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
     raw_frames_dir.mkdir(parents=True, exist_ok=True)
     transparent_frames_dir.mkdir(parents=True, exist_ok=True)
+    animations_dir.mkdir(parents=True, exist_ok=True)
 
     if has_complete_frame_set(transparent_frames_dir, frames):
         emit(f"Reusing transparent frames: {transparent_frames_dir}")
@@ -130,44 +138,50 @@ def make_animation(
         if len(raw_frames) != frames or len(transparent_frames) != frames:
             raise PipelineError("failed to produce the requested number of frames")
 
-    emit(f"Encoding {output_format.value} animation: {output_path}")
+    emit(f"Writing {output_format.value} output: {output_path}")
     run_checked(
-        build_encode_animation_cmd(
+        build_render_output_cmd(
             tools.ffmpeg,
             transparent_frames_dir,
             output_path,
             output_format,
             fps,
+            frames,
+            spritesheet_rows=spritesheet_rows,
+            spritesheet_columns=spritesheet_columns,
         )
     )
 
     kept_intermediates = keep_temp
     if not keep_temp:
-        emit(f"Deleting intermediate frames: {frame_cache_dir}")
-        shutil.rmtree(frame_cache_dir, ignore_errors=True)
+        emit(f"Deleting intermediate frames")
+        shutil.rmtree(raw_frames_dir, ignore_errors=True)
+        shutil.rmtree(transparent_frames_dir, ignore_errors=True)
     else:
         emit(f"Keeping raw frames: {raw_frames_dir}")
         emit(f"Keeping transparent frames: {transparent_frames_dir}")
 
     return MakeResult(
         output_path=output_path,
+        job_dir=job_dir,
         raw_frames_dir=raw_frames_dir,
         transparent_frames_dir=transparent_frames_dir,
+        animations_dir=animations_dir,
         kept_intermediates=kept_intermediates,
     )
 
 
-def normalize_output_path(output_path: Path, output_format: AnimationFormat) -> Path:
-    if output_path.suffix:
-        return output_path
-    return output_path.with_suffix(f".{output_format.value}")
+def build_output_path(animations_dir: Path, output_format: AnimationFormat, fps: float) -> Path:
+    if output_format is AnimationFormat.SPRITESHEET:
+        return animations_dir / "spritesheet.webp"
+    return animations_dir / f"animation-{format_fps(fps)}fps.{output_format.value}"
 
 
-def build_frame_cache_dir(output_parent: Path, cache_tag: str) -> Path:
-    return output_parent / "_tbam_frames" / cache_tag
+def build_job_dir(output_dir: Path, job_tag: str) -> Path:
+    return output_dir / job_tag
 
 
-def build_frame_cache_tag(
+def build_job_tag(
     video_path: Path,
     frames: int,
     background_options: BackgroundRemovalOptions,
@@ -180,7 +194,7 @@ def build_frame_cache_tag(
         "background": background_options_fingerprint(background_options),
     }
     digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()[:12]
-    return f"{stem}_frames-{frames}_{digest}"
+    return f"{stem}-{frames}frames-{digest}"
 
 
 def slugify(value: str) -> str:
@@ -394,12 +408,16 @@ def build_remove_background_cmd(
     return command
 
 
-def build_encode_animation_cmd(
+def build_render_output_cmd(
     ffmpeg: str,
     frames_dir: Path,
     output_path: Path,
     output_format: AnimationFormat,
     fps: float,
+    frame_count: int,
+    *,
+    spritesheet_rows: int | None = None,
+    spritesheet_columns: int | None = None,
 ) -> list[str]:
     input_pattern = frames_dir / "frame_%06d.png"
     base = [
@@ -443,8 +461,56 @@ def build_encode_animation_cmd(
             "0",
             str(output_path),
         ]
+    if output_format is AnimationFormat.SPRITESHEET:
+        columns, rows = calculate_spritesheet_layout(
+            frame_count,
+            rows=spritesheet_rows,
+            columns=spritesheet_columns,
+        )
+        return [
+            *base,
+            "-an",
+            "-vf",
+            f"tile={columns}x{rows}:color=black@0.0,format=rgba",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "libwebp",
+            "-lossless",
+            "1",
+            str(output_path),
+        ]
 
     raise PipelineError(f"unsupported animation format: {output_format}")
+
+
+def calculate_spritesheet_layout(
+    frame_count: int,
+    *,
+    rows: int | None = None,
+    columns: int | None = None,
+) -> tuple[int, int]:
+    if frame_count < 1:
+        raise PipelineError("frame_count must be at least 1")
+    if rows is not None and rows < 1:
+        raise PipelineError("spritesheet rows must be at least 1")
+    if columns is not None and columns < 1:
+        raise PipelineError("spritesheet columns must be at least 1")
+
+    if rows is None and columns is None:
+        columns = math.ceil(math.sqrt(frame_count))
+        rows = math.ceil(frame_count / columns)
+    elif rows is None:
+        rows = math.ceil(frame_count / columns)
+    elif columns is None:
+        columns = math.ceil(frame_count / rows)
+
+    if rows * columns < frame_count:
+        raise PipelineError(
+            f"spritesheet layout {columns}x{rows} only fits {rows * columns} frame(s), "
+            f"but {frame_count} frame(s) are required"
+        )
+    return columns, rows
 
 
 def format_fps(fps: float) -> str:

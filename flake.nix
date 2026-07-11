@@ -25,6 +25,7 @@
             stdenv.cc.cc.lib
             zlib
           ];
+          nixLibraryPath = pkgs.lib.makeLibraryPath linuxLibraries;
         in
         {
           default = pkgs.mkShell {
@@ -41,9 +42,36 @@
 
             shellHook = ''
               ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-                export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath linuxLibraries}:''${LD_LIBRARY_PATH:-}"
+                # PyTorch's Linux wheel includes the CUDA runtime, but libcuda.so
+                # must come from the host NVIDIA driver. NixOS exposes it under
+                # /run/opengl-driver; the other entries cover common non-NixOS,
+                # WSL, and container installations.
+                cudaDriverPaths=(
+                  /run/opengl-driver/lib
+                  /run/opengl-driver-32/lib
+                  /usr/lib/wsl/lib
+                  /usr/lib/x86_64-linux-gnu
+                  /usr/lib/aarch64-linux-gnu
+                  /usr/lib64
+                  /usr/local/cuda/compat
+                  /usr/local/nvidia/lib64
+                )
+                cudaDriverLibraryPath=""
+
+                for path in "''${cudaDriverPaths[@]}"; do
+                  if [ -e "$path/libcuda.so.1" ] || [ -e "$path/libcuda.so" ]; then
+                    cudaDriverLibraryPath="''${cudaDriverLibraryPath:+$cudaDriverLibraryPath:}$path"
+                  fi
+                done
+
+                export LD_LIBRARY_PATH="''${cudaDriverLibraryPath:+$cudaDriverLibraryPath:}${nixLibraryPath}:''${LD_LIBRARY_PATH:-}"
+
+                if [ -z "$cudaDriverLibraryPath" ]; then
+                  echo "Warning: libcuda.so was not found. Install/configure the host NVIDIA driver before using CUDA."
+                fi
               ''}
               echo "Run 'uv sync --dev' to install the project dependencies."
+              echo "Check CUDA with: uv run python -c 'import torch; print(torch.cuda.is_available())'"
             '';
           };
         }
